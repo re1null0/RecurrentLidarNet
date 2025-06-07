@@ -8,6 +8,10 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.utils import shuffle
+import gym
+from stable_baselines import PPO2
+from stable_baselines.common.policies import ActorCriticPolicy
+from stable_baselines.common.vec_env import DummyVecEnv
 
 # ROS 2 bag imports
 from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
@@ -119,6 +123,73 @@ def build_spatiotemporal_model(seq_len, num_ranges):
     return Model(inp, out, name='RNN_Attention_Controller')
 
 #========================================================
+# RL environment and policy for PPO2
+#========================================================
+class LidarSequenceEnv(gym.Env):
+    """Minimal gym environment over the prerecorded lidar sequences."""
+
+    def __init__(self, sequences, targets):
+        super().__init__()
+        self.sequences = sequences
+        self.targets = targets
+        self.idx = 0
+        obs_shape = sequences.shape[1:]
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf, high=np.inf, shape=obs_shape, dtype=np.float32
+        )
+        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+
+    def reset(self):
+        self.idx = 0
+        return self.sequences[self.idx]
+
+    def step(self, action):
+        target = self.targets[self.idx]
+        reward = -np.mean((action - target) ** 2)
+        self.idx += 1
+        done = self.idx >= len(self.sequences)
+        obs = self.sequences[self.idx] if not done else np.zeros_like(self.sequences[0])
+        return obs, reward, done, {}
+
+
+class RLnPolicy(ActorCriticPolicy):
+    """Custom policy with Conv -> Bi-LSTM -> Attention."""
+
+    def __init__(self, sess, ob_space, ac_space, n_env, n_steps, n_batch, **kwargs):
+        super(RLnPolicy, self).__init__(
+            sess, ob_space, ac_space, n_env, n_steps, n_batch, layers=[64], **kwargs
+        )
+        seq_len = ob_space.shape[0]
+        num_ranges = ob_space.shape[1]
+        with tf.variable_scope("rl2net"):
+            x = tf.reshape(self.processed_obs, [-1, seq_len, num_ranges, 2])
+            # example convolutional feature extractor
+            x = tf.reshape(x, [-1, num_ranges, 2])
+            x = tf.layers.conv1d(x, 24, 10, 4, activation=tf.nn.relu)
+            x = tf.layers.conv1d(x, 36, 8, 4, activation=tf.nn.relu)
+            x = tf.layers.conv1d(x, 48, 4, 2, activation=tf.nn.relu)
+            x = tf.layers.flatten(x)
+            x = tf.reshape(x, [n_batch, seq_len, -1])
+            lstm_out, _ = tf.nn.bidirectional_dynamic_rnn(
+                tf.keras.layers.LSTMCell(64),
+                tf.keras.layers.LSTMCell(64),
+                x,
+                dtype=tf.float32,
+            )
+            lstm_out = tf.concat(lstm_out, axis=-1)
+            q = tf.layers.dense(lstm_out, 64)
+            k = tf.layers.dense(lstm_out, 64)
+            v = tf.layers.dense(lstm_out, 64)
+            attn = tf.keras.layers.Attention()([q, v, k])
+            context = tf.reduce_mean(attn, axis=1)
+            pi_h = tf.layers.dense(context, 64, activation=tf.nn.tanh)
+            vf_h = tf.layers.dense(context, 64, activation=tf.nn.tanh)
+
+        self.pi_latent = pi_h
+        self.vf_latent = vf_h
+        self._setup_init()
+
+#========================================================
 # Main
 #========================================================
 if __name__ == '__main__':
@@ -200,3 +271,24 @@ if __name__ == '__main__':
     # Final evaluation
     test_loss = model.evaluate(X_test, y_test, verbose=0)
     print(f'Final test loss: {test_loss:.4f}')
+
+    # ================= RL fine tuning with PPO2 =================
+    env = DummyVecEnv([lambda: LidarSequenceEnv(X_train, y_train)])
+    model_rl = PPO2(
+        policy=RLnPolicy,
+        env=env,
+        n_steps=seq_len * 20,
+        nminibatches=1,
+        lam=0.95,
+        gamma=0.99,
+        verbose=1,
+        tensorboard_log="./rl2_tb/",
+    )
+
+    # Optionally load pretrained weights (if available)
+    if os.path.exists("Models/ppo_rln.zip"):
+        model_rl.load("Models/ppo_rln")
+
+    model_rl.learn(total_timesteps=100000)
+    os.makedirs("Models", exist_ok=True)
+    model_rl.save("Models/ppo_rln")
